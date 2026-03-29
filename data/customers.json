@@ -1,0 +1,8 @@
+{
+  "12345": {
+    "customer_id": "12345",
+    "segment": "premium",
+    "account_age_years": 8,
+    "relationship_value": "high"
+  }
+}
