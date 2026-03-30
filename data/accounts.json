@@ -1,0 +1,10 @@
+{
+  "acc_123": {
+    "balance": 4900.0,
+    "currency": "USD"
+  },
+  "acc_456": {
+    "balance": 250.0,
+    "currency": "USD"
+  }
+}

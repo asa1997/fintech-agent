@@ -13,9 +13,12 @@ class MCPServices:
         self.sessions = {}
 
     async def start(self):
+        # Existing connections
         await self._connect("customer", ROOT / "mcp-servers" / "customer-profile" / "server.py")
         await self._connect("risk", ROOT / "mcp-servers" / "credit-risk" / "server.py")
-        await self._connect("policy", ROOT / "mcp-servers" / "rag-policy" / "server.py")
+        # await self._connect("policy", ROOT / "mcp-servers" / "rag-policy" / "server.py")
+        await self._connect("banking", ROOT / "mcp-servers" / "banking" / "server.py")
+        
         return self
 
     async def _connect(self, name: str, script_path: Path):
