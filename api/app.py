@@ -31,7 +31,8 @@ class MessageRequest(BaseModel):
 async def chat(req: MessageRequest):
     # Pass the incoming API payload to your agent loop
     response = await handle_message(services, req.customer_id, req.message)
-    return {"reply": response}
+    # return {"reply": response}
+    return response
 
 if __name__ == "__main__":
     uvicorn.run("api.app:app", host="0.0.0.0", port=8000, reload=True)
