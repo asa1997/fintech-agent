@@ -2,6 +2,10 @@ import asyncio
 import sys
 from agent.mcp_client import MCPServices
 from agent.agent import handle_message
+import logging
+
+# Configure logging format and level (Set to INFO for clean output, DEBUG to see raw LLM text)
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
 
 async def main():
     print("Starting Banking Agent... (Initializing MCP Servers)")

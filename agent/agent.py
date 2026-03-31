@@ -1,92 +1,108 @@
-import json
+# from langchain_community.chat_models import ChatOllama
+from langchain_ollama import ChatOllama
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_classic.agents import AgentExecutor, create_tool_calling_agent
+from langchain_core.tools import StructuredTool
+from pydantic import BaseModel, Field
+
 from .intent_classifier import classify_intent
-from .ollama_client import ollama_chat
 
 ESCALATION_TEXT = "This issue requires further investigation. I’m escalating this to our support team."
 
-# The Brain's Instructions
-SYSTEM_PROMPT = """You are an autonomous, secure banking assistant. 
-You have access to the following tools:
-- get_balance: args: {"account_id": "<string>"}
-- transfer_funds: args: {"source_id": "<string>", "target_id": "<string>", "amount": <float>}
-- get_customer_profile: args: {"customer_id": "<string>"}
+# 1. Define Pydantic Schemas for Strict Typing
+class BalanceInput(BaseModel):
+    account_id: str = Field(description="The ID of the account to check.")
 
-You must execute actions by outputting STRICTLY valid JSON without any markdown formatting. 
-If you need to use a tool, output: 
-{"action": "call_tool", "tool_name": "<name>", "arguments": {"arg1": "value"}}
+class TransferInput(BaseModel):
+    source_id: str = Field(description="The account ID to pull money from.")
+    target_id: str = Field(description="The account ID to send money to.")
+    amount: float = Field(description="The amount of money to transfer.")
 
-If you have enough information to answer the user, output: 
-{"action": "final_answer", "text": "<your response to the user>"}
-
-Do not output any other text or explanations outside of the JSON block.
-"""
+class ProfileInput(BaseModel):
+    customer_id: str = Field(description="The ID of the customer.")
 
 async def handle_message(services, customer_id: str, message: str) -> str:
-    # 1. Fast path for complaints
+    # Fast path for complaints remains the same
     intent = await classify_intent(message)
     if intent == "complaint":
         return ESCALATION_TEXT
 
-    # 2. Initialize the conversation state
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": f"Authenticated Customer ID: {customer_id}\nUser Message: {message}"}
+    # 2. Define LangChain Tools (Closing over `services` and `customer_id`)
+    async def _get_balance(account_id: str) -> str:
+        if account_id != customer_id:
+            return "Security Violation: Unauthorized account access."
+        try:
+            res = await services.call_tool("banking", "get_balance", {"account_id": account_id})
+            return str(res.content[0].text if hasattr(res, 'content') else res)
+        except Exception as e:
+            return f"Error: {str(e)}"
+
+    async def _transfer_funds(source_id: str, target_id: str, amount: float) -> str:
+        if source_id != customer_id:
+            return "Security Violation: You can only transfer funds from your own account."
+        try:
+            res = await services.call_tool("banking", "transfer_funds", {"source_id": source_id, "target_id": target_id, "amount": amount})
+            return str(res.content[0].text if hasattr(res, 'content') else res)
+        except Exception as e:
+            return f"Error: {str(e)}"
+
+    async def _get_profile(customer_id_input: str) -> str:
+        if customer_id_input != customer_id:
+            return "Security Violation: Unauthorized profile access."
+        try:
+            res = await services.call_tool("customer", "get_customer_profile", {"customer_id": customer_id_input})
+            return str(res.content[0].text if hasattr(res, 'content') else res)
+        except Exception as e:
+            return f"Error: {str(e)}"
+
+    # Wrap functions into LangChain StructuredTools
+    tools = [
+        StructuredTool.from_function(
+            coroutine=_get_balance,
+            name="get_balance",
+            description="Fetch the current balance for a specific account ID.",
+            args_schema=BalanceInput,
+        ),
+        StructuredTool.from_function(
+            coroutine=_transfer_funds,
+            name="transfer_funds",
+            description="Transfer funds from one account to another.",
+            args_schema=TransferInput,
+        ),
+        StructuredTool.from_function(
+            coroutine=_get_profile,
+            name="get_customer_profile",
+            description="Get the banking profile for the current customer.",
+            args_schema=ProfileInput,
+        )
     ]
 
-    # 3. The Execution Loop (Capped at 5 to prevent infinite loops/hallucinations)
-    for step in range(5):
-        # Ask the LLM what to do next
-        raw_response = await ollama_chat(messages)
-        
-        try:
-            # Strip potential markdown code blocks the LLM might hallucinate
-            clean_response = raw_response.replace("```json", "").replace("```", "").strip()
-            decision = json.loads(clean_response)
-        except json.JSONDecodeError:
-            # If the LLM outputs garbage, feed the error back so it self-corrects
-            messages.append({"role": "assistant", "content": raw_response})
-            messages.append({"role": "user", "content": "Error: You must output strictly valid JSON. Try again."})
-            continue
+    # 3. Initialize the LLM (Must support tool calling, e.g., llama3.1)
+    llm = ChatOllama(model="llama3.2:latest", temperature=0)
 
-        # Record the LLM's valid decision in the context
-        messages.append({"role": "assistant", "content": clean_response})
+    # 4. Create the Prompt Template
+    # 4. Create the Prompt Template (LangChain handles the tool JSON formatting)
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", """You are an autonomous, secure banking assistant. 
+The authenticated customer_id for this session is {customer_id}.
 
-        # Branch A: The LLM is done and wants to speak to the user
-        if decision.get("action") == "final_answer":
-            return decision.get("text", "Error: No text provided in final answer.")
-            
-        # Branch B: The LLM wants to use a tool
-        elif decision.get("action") == "call_tool":
-            tool_name = decision.get("tool_name")
-            args = decision.get("arguments", {})
-            
-            # Map the tool to the correct MCP server
-            service_map = {
-                "get_balance": "banking",
-                "transfer_funds": "banking",
-                "get_customer_profile": "customer"
-            }
-            
-            target_service = service_map.get(tool_name)
-            
-            if not target_service:
-                tool_result = f"Error: Tool {tool_name} does not exist or is unauthorized."
-            else:
-                # Security Check: Prevent the LLM from querying other users' data
-                # A real production system enforces this at the MCP server level, 
-                # but we catch it here to prevent basic prompt injections.
-                if tool_name in ["get_balance", "get_customer_profile"] and args.get("account_id", args.get("customer_id")) != customer_id:
-                    tool_result = "Security Violation: You are not authorized to access other accounts."
-                else:
-                    # Execute the MCP tool
-                    try:
-                        mcp_result = await services.call_tool(target_service, tool_name, args)
-                        # MCP returns a CallToolResult object, we extract the text
-                        tool_result = str(mcp_result.content[0].text if mcp_result.content else mcp_result)
-                    except Exception as e:
-                        tool_result = f"Tool Execution Failed: {str(e)}"
+CRITICAL INSTRUCTIONS:
+1. You may only use the tools explicitly provided to you.
+2. If the user asks you to perform an action you do not have a tool for (like withdrawing funds, depositing funds, or closing an account), DO NOT guess a tool name and DO NOT attempt to use a different tool to hack a solution.
+3. If you cannot fulfill the request, politely explain your limitations to the user directly (e.g., "I cannot withdraw funds because I only have access to transfers and balance checks.").
+"""),
+        ("user", "{input}"),
+        MessagesPlaceholder(variable_name="agent_scratchpad"),
+    ])
 
-            # Feed the physical result back to the LLM so it can observe what happened
-            messages.append({"role": "user", "content": f"Tool Result: {tool_result}"})
-            
-    return "System Error: Agent exceeded maximum execution steps. Transaction aborted."
+    # 5. Build and Execute the Agent
+    agent = create_tool_calling_agent(llm, tools, prompt)
+    agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True, max_iterations=5)
+
+    # Run the chain
+    response = await agent_executor.ainvoke({
+        "input": message,
+        "customer_id": customer_id
+    })
+
+    return response.get("output", "System Error.")
